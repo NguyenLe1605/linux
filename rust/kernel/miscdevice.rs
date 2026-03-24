@@ -13,12 +13,13 @@ use crate::{
     device::Device,
     error::{to_result, Error, Result, VTABLE_DEFAULT_ERROR},
     ffi::{c_int, c_long, c_uint, c_ulong},
-    fs::{File, Kiocb},
+    fs::{file::Offset, File, Kiocb},
     iov::{IovIterDest, IovIterSource},
     mm::virt::VmaNew,
     prelude::*,
     seq_file::SeqFile,
     types::{ForeignOwnable, Opaque},
+    uaccess::{UserSlice, UserSliceReader, UserSliceWriter},
 };
 use core::{marker::PhantomData, pin::Pin};
 
@@ -151,6 +152,36 @@ pub trait MiscDevice: Sized {
         build_error!(VTABLE_DEFAULT_ERROR)
     }
 
+    /// Handler for read
+    fn read(
+        _device: <Self::Ptr as ForeignOwnable>::Borrowed<'_>,
+        _file: &File,
+        _writer: UserSliceWriter,
+        _offset: &mut Offset,
+    ) -> Result<isize> {
+        build_error!(VTABLE_DEFAULT_ERROR)
+    }
+
+    /// Handler for write
+    fn write(
+        _device: <Self::Ptr as ForeignOwnable>::Borrowed<'_>,
+        _file: &File,
+        _reader: UserSliceReader,
+        _offset: &mut Offset,
+    ) -> Result<isize> {
+        build_error!(VTABLE_DEFAULT_ERROR)
+    }
+
+    /// Handler for llseek
+    fn llseek(
+        _device: <Self::Ptr as ForeignOwnable>::Borrowed<'_>,
+        _file: &File,
+        _offset: Offset,
+        _whence: isize,
+    ) -> Result<Offset> {
+        build_error!(VTABLE_DEFAULT_ERROR)
+    }
+
     /// Handler for ioctls.
     ///
     /// The `cmd` argument is usually manipulated using the utilities in [`kernel::ioctl`].
@@ -275,6 +306,58 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         }
     }
 
+    unsafe extern "C" fn read(
+        file: *mut bindings::file,
+        buf: *mut ffi::c_char,
+        count: usize,
+        offset: *mut bindings::loff_t,
+    ) -> isize {
+        let private = unsafe { (*file).private_data };
+        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private.cast()) };
+        let file = unsafe { File::from_raw_file(file) };
+        let user_ptr = UserPtr::from_ptr(buf as *mut c_void);
+        let user_slice = UserSlice::new(user_ptr, count);
+        let writer = user_slice.writer();
+        let offset = unsafe { &mut *offset };
+        match T::read(device, file, writer, offset) {
+            Ok(res) => res,
+            Err(err) => err.to_errno() as isize,
+        }
+    }
+
+    unsafe extern "C" fn llseek(
+        file: *mut bindings::file,
+        offset: bindings::loff_t,
+        whence: ffi::c_int,
+    ) -> bindings::loff_t {
+        let private = unsafe { (*file).private_data };
+        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private.cast()) };
+        let file = unsafe { File::from_raw_file(file) };
+        match T::llseek(device, file, offset, whence as isize) {
+            Ok(res) => res,
+            Err(err) => err.to_errno() as bindings::loff_t,
+        }
+    }
+
+    unsafe extern "C" fn write(
+        file: *mut bindings::file,
+        buf: *const ffi::c_char,
+        count: usize,
+        offset: *mut bindings::loff_t,
+    ) -> isize {
+        let private = unsafe { (*file).private_data };
+        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private.cast()) };
+        let file = unsafe { File::from_raw_file(file) };
+        let user_ptr = UserPtr::from_ptr(buf as *mut c_void);
+        let user_slice = UserSlice::new(user_ptr, count);
+        let reader = user_slice.reader();
+        let offset = unsafe { &mut *offset };
+        match T::write(device, file, reader, offset) {
+            Ok(res) => res,
+            Err(err) => err.to_errno() as isize,
+        }
+    }
+
     /// # Safety
     ///
     /// `kiocb` must be correspond to a valid file that is associated with a
@@ -391,6 +474,17 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         open: Some(Self::open),
         release: Some(Self::release),
         mmap: if T::HAS_MMAP { Some(Self::mmap) } else { None },
+        read: if T::HAS_READ { Some(Self::read) } else { None },
+        write: if T::HAS_WRITE {
+            Some(Self::write)
+        } else {
+            None
+        },
+        llseek: if T::HAS_LLSEEK {
+            Some(Self::llseek)
+        } else {
+            None
+        },
         read_iter: if T::HAS_READ_ITER {
             Some(Self::read_iter)
         } else {
